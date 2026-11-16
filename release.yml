@@ -1,0 +1,360 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'          # v1.2.3
+      - 'v*.*.*-*'        # v1.2.3-beta
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег для релиза (например, v5.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Пометить как pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write         # создать релиз
+  packages: write         # (опционально) Docker
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================
+  # 1. ЛИНТ И ПРОВЕРКА ПЕРЕД СБОРКОЙ
+  # ============================================
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo, pdo_mysql, json, mbstring
+          tools: composer:v2
+          coverage: none
+
+      - name: PHP lint — все файлы
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r -d '' f; do
+            echo "→ $f"
+            php -l "$f" || fail=1
+          done < <(find . -name '*.php' -not -path './vendor/*' -print0)
+          exit $fail
+
+      - name: Проверка обязательных файлов
+        run: |
+          set -e
+          required=(
+            "config.sample.php"
+            "install.php"
+            "installer.sh"
+            "api.php"
+            "index.php"
+            "db.sql"
+            "db_migration_2.sql"
+            "db_migration_3.sql"
+            "db_migration_4.sql"
+            "db_migration_5.sql"
+            "assets/app.js"
+            "assets/style.css"
+            "assets/canvas.js"
+            "assets/sound.js"
+            "assets/animate.js"
+            "assets/events.js"
+            "assets/dialogue.js"
+          )
+          for f in "${required[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "✕ Отсутствует: $f"
+              exit 1
+            fi
+            echo "✓ $f"
+          done
+
+      - name: Проверка JS-синтаксиса
+        run: |
+          set -e
+          for f in assets/*.js; do
+            echo "→ $f"
+            node --check "$f" || exit 1
+          done
+        # node уже есть на ubuntu-latest
+
+      - name: Проверка SQL-файлов (быстрый smoke)
+        run: |
+          set -e
+          for f in db*.sql; do
+            echo "→ $f"
+            # проверим, что файл не пустой и не содержит типичных ошибок
+            [ -s "$f" ] || { echo "✕ Пустой: $f"; exit 1; }
+            grep -qi 'CREATE\|INSERT\|ALTER' "$f" || { echo "✕ Нет DDL/DML: $f"; exit 1; }
+          done
+
+  # ============================================
+  # 2. СБОРКА АРХИВА
+  # ============================================
+  build:
+    name: Build archive
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # нужен git describe
+
+      - name: Определить версию
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.tag }}"
+            PRE="${{ inputs.prerelease }}"
+          else
+            V="${GITHUB_REF#refs/tags/}"
+            # pre-release если в теге есть дефис (v1.2.3-beta)
+            if [[ "$V" == *-* ]]; then PRE="true"; else PRE="false"; fi
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "→ Version: $V  prerelease: $PRE"
+
+      - name: Установить имя проекта
+        id: meta
+        run: |
+          echo "name=ocharovanie" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Собрать staging-папку
+        run: |
+          set -euo pipefail
+          STAGE="staging/${{ steps.meta.outputs.name }}"
+          mkdir -p "$STAGE"
+
+          FILES=(
+            config.sample.php
+            install.php
+            installer.sh
+            Makefile
+            .htaccess
+            api.php
+            index.php
+            README.md
+            scenario_week1.md
+            docker-compose.yml
+            db.sql
+            db_migration_2.sql
+            db_migration_3.sql
+            db_migration_4.sql
+            db_migration_5.sql
+            db_dialogues_seed.sql
+            db_phrases_seed.sql
+            db_templates_seed.sql
+            assets
+          )
+
+          for f in "${FILES[@]}"; do
+            if [ -e "$f" ]; then
+              cp -r "$f" "$STAGE/"
+            else
+              echo "⚠ пропущено: $f"
+            fi
+          done
+
+          # ВАЖНО: не включаем config.php и служебные файлы
+          rm -f "$STAGE/config.php"
+          rm -rf "$STAGE/.git" "$STAGE/dist" "$STAGE/staging" "$STAGE/node_modules" "$STAGE/vendor"
+
+          # гарантируем исполняемость установщика
+          chmod +x "$STAGE/installer.sh" 2>/dev/null || true
+
+          # version.json
+          cat > "$STAGE/VERSION.json" <<EOF
+          {
+            "name": "${{ steps.meta.outputs.name }}",
+            "version": "${{ steps.version.outputs.version }}",
+            "commit": "${{ steps.meta.outputs.sha_short }}",
+            "built_at": "${{ steps.meta.outputs.date }}",
+            "repository": "${{ github.server_url }}/${{ github.repository }}"
+          }
+          EOF
+
+          # список файлов
+          (cd "$STAGE" && find . -type f | sort > FILES.txt)
+
+      - name: Создать tar.gz
+        run: |
+          set -euo pipefail
+          cd staging
+          NAME="${{ steps.meta.outputs.name }}-${{ steps.version.outputs.version }}"
+          tar -czf "../$NAME.tar.gz" "${{ steps.meta.outputs.name }}"
+          echo "✓ $NAME.tar.gz ($(du -h ../$NAME.tar.gz | cut -f1))"
+
+      - name: Создать zip
+        run: |
+          set -euo pipefail
+          cd staging
+          NAME="${{ steps.meta.outputs.name }}-${{ steps.version.outputs.version }}"
+          zip -qr "../$NAME.zip" "${{ steps.meta.outputs.name }}"
+          echo "✓ $NAME.zip ($(du -h ../$NAME.zip | cut -f1))"
+
+      - name: Контрольные суммы
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.meta.outputs.name }}-${{ steps.version.outputs.version }}"
+          sha256sum "$NAME.tar.gz" "$NAME.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Проверить содержимое архива
+        run: |
+          NAME="${{ steps.meta.outputs.name }}-${{ steps.version.outputs.version }}"
+          echo "=== tar.gz содержимое (первые 30) ==="
+          tar -tzf "$NAME.tar.gz" | head -30
+          echo "=== проверка отсутствия config.php ==="
+          if tar -tzf "$NAME.tar.gz" | grep -q '/config.php$'; then
+            echo "✕ config.php попал в архив — нельзя!"
+            exit 1
+          fi
+          echo "✓ config.php отсутствует"
+          echo "=== проверка ключевых файлов ==="
+          for f in install.php api.php index.php assets/app.js db_migration_5.sql; do
+            tar -tzf "$NAME.tar.gz" | grep -q "/$f$" || { echo "✕ Нет $f в архиве"; exit 1; }
+          done
+          echo "✓ Все ключевые файлы на месте"
+
+      - name: Smoke-тест установки
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.meta.outputs.name }}-${{ steps.version.outputs.version }}"
+          mkdir -p smoke && cd smoke
+          tar -xzf "../$NAME.tar.gz"
+          cd "${{ steps.meta.outputs.name }}"
+          # пробуем php -l на всех
+          find . -name '*.php' -exec php -l {} \; > /dev/null
+          echo "✓ PHP-файлы в архиве синтаксически валидны"
+
+      - name: Загрузить артефакты
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.meta.outputs.name }}-${{ steps.version.outputs.version }}.tar.gz
+            ${{ steps.meta.outputs.name }}-${{ steps.version.outputs.version }}.zip
+            SHA256SUMS.txt
+          retention-days: 30
+
+  # ============================================
+  # 3. ПУБЛИКАЦИЯ РЕЛИЗА
+  # ============================================
+  publish:
+    name: Publish release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Скачать артефакты
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Сгенерировать release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          V="${{ needs.build.outputs.version }}"
+          PREV=$(git tag --sort=-v:refname | grep -E '^v[0-9]' | grep -v "^$V$" | head -n1 || true)
+          {
+            echo "## 🌸 Очарование Судьбы — $V"
+            echo ""
+            echo "Сборка от $(date -u +'%Y-%m-%d %H:%M UTC')."
+            echo ""
+            echo "### 📦 Скачать"
+            echo ""
+            echo "| Формат | Файл |"
+            echo "|--------|------|"
+            echo "| ZIP | \`ocharovanie-$V.zip\` |"
+            echo "| TAR.GZ | \`ocharovanie-$V.tar.gz\` |"
+            echo "| Контрольные суммы | \`SHA256SUMS.txt\` |"
+            echo ""
+            echo "### 🚀 Установка"
+            echo ""
+            echo '```bash'
+            echo "unzip ocharovanie-$V.zip"
+            echo "cd ocharovanie"
+            echo "# вариант 1: веб-установщик"
+            echo "#   → открой http://your-host/install.php"
+            echo "# вариант 2: CLI"
+            echo "DB_USER=root DB_PASS=secret ./installer.sh"
+            echo "# вариант 3: Docker"
+            echo "docker-compose up -d"
+            echo '```'
+            echo ""
+            if [ -n "$PREV" ]; then
+              echo "### 📝 Изменения с $PREV"
+              echo ""
+              git log --pretty=format:'- %s (%h)' "$PREV..HEAD" | head -50
+              echo ""
+            else
+              echo "### 📝 Первый релиз"
+              echo ""
+              git log --pretty=format:'- %s (%h)' | head -20
+              echo ""
+            fi
+            echo ""
+            echo "### 🔒 Проверка целостности"
+            echo ""
+            echo '```'
+            echo "sha256sum -c SHA256SUMS.txt"
+            echo '```'
+            echo ""
+            echo "---"
+            echo ""
+            echo "**SHA**: \`${{ github.sha }}\`"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Создать GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: 🌸 Очарование Судьбы ${{ needs.build.outputs.version }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ needs.build.outputs.is_prerelease == 'true' }}
+          generate_release_notes: false
+          files: |
+            dist/ocharovanie-${{ needs.build.outputs.version }}.tar.gz
+            dist/ocharovanie-${{ needs.build.outputs.version }}.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Уведомление в job summary
+        run: |
+          {
+            echo "## ✅ Релиз ${{ needs.build.outputs.version }} опубликован"
+            echo ""
+            echo "- 🔗 [${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.build.outputs.version }}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.build.outputs.version }})"
+            echo "- 📦 ZIP: \`ocharovanie-${{ needs.build.outputs.version }}.zip\`"
+            echo "- 📦 TAR.GZ: \`ocharovanie-${{ needs.build.outputs.version }}.tar.gz\`"
+            echo "- 🔒 SHA256: \`SHA256SUMS.txt\`"
+          } >> "$GITHUB_STEP_SUMMARY"

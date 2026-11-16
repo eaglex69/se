@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+  pull_request:
+    branches: [main, master, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  php-lint:
+    name: PHP ${{ matrix.php }} lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo, pdo_mysql, mbstring, json
+          coverage: none
+      - name: Lint
+        run: |
+          fail=0
+          while IFS= read -r -d '' f; do
+            php -l "$f" || fail=1
+          done < <(find . -name '*.php' -not -path './vendor/*' -print0)
+          exit $fail
+
+  js-lint:
+    name: JS syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: check
+        run: |
+          for f in assets/*.js; do
+            echo "→ $f"
+            node --check "$f"
+          done
+
+  sql-smoke:
+    name: SQL smoke test
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: ocharovanie
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Импорт всех миграций
+        run: |
+          set -e
+          for f in db.sql db_migration_2.sql db_migration_3.sql db_migration_4.sql db_migration_5.sql \
+                   db_dialogues_seed.sql db_phrases_seed.sql db_templates_seed.sql; do
+            echo "→ $f"
+            sed -E 's/^[[:space:]]*USE[[:space:]]+[^;]+;//i' "$f" | \
+              mysql -h 127.0.0.1 -uroot -proot ocharovanie
+          done
+          echo "=== Проверка таблиц ==="
+          mysql -h 127.0.0.1 -uroot -proot ocharovanie -e "SHOW TABLES;"
+          echo "=== Проверка героинь ==="
+          mysql -h 127.0.0.1 -uroot -proot ocharovanie -e "SELECT COUNT(*) AS heroines FROM heroines;"
+          echo "=== Проверка фраз ==="
+          mysql -h 127.0.0.1 -uroot -proot ocharovanie -e "SELECT COUNT(*) AS phrases FROM phrase_bank;"
+          echo "=== Проверка шаблонов ==="
+          mysql -h 127.0.0.1 -uroot -proot ocharovanie -e "SELECT COUNT(*) AS templates FROM event_templates;"
+
+  archive-smoke:
+    name: Archive smoke test
+    needs: [php-lint, js-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать staging
+        run: |
+          mkdir -p staging/ocharovanie
+          for f in config.sample.php install.php installer.sh Makefile .htaccess \
+                   api.php index.php README.md scenario_week1.md docker-compose.yml \
+                   db.sql db_migration_2.sql db_migration_3.sql db_migration_4.sql db_migration_5.sql \
+                   db_dialogues_seed.sql db_phrases_seed.sql db_templates_seed.sql assets; do
+            [ -e "$f" ] && cp -r "$f" staging/ocharovanie/ || echo "⚠ $f"
+          done
+          rm -f staging/ocharovanie/config.php
+      - name: Упаковать и распаковать
+        run: |
+          cd staging
+          tar -czf /tmp/test.tar.gz ocharovanie
+          cd /tmp
+          mkdir check && cd check
+          tar -xzf /tmp/test.tar.gz
+          cd ocharovanie
+          # проверки
+          [ -f install.php ] || { echo "✕ нет install.php"; exit 1; }
+          [ -f api.php ] || { echo "✕ нет api.php"; exit 1; }
+          [ -f assets/app.js ] || { echo "✕ нет app.js"; exit 1; }
+          [ ! -f config.php ] || { echo "✕ config.php не должен быть в архиве"; exit 1; }
+          echo "✓ Архив валиден"
